@@ -584,9 +584,9 @@ public struct AsyncImageView<Placeholder: View>: View {
             Group {
                 if let img = uiImage {
                     #if canImport(UIKit)
-                    Image(uiImage: img).resizable().scaledToFit()
+                    Image(uiImage: img).resizable().scaledToFill()
 #else
-                    Image(nsImage: img).resizable().scaledToFit()
+                    Image(nsImage: img).resizable().scaledToFill()
 #endif
                 } else {
                     if didFail {
