@@ -97,27 +97,27 @@ public struct ImageKitConfiguration: Sendable {
     public var accepts: String
     
     public init(
-        memoryBytes: Int = 128 * 1024 * 1024,
-        diskBytes: Int64 = 512 * 1024 * 1024,
-        diskPathName: String = "ImageKitCache",
-        defaultTTL: TimeInterval = 30 * 24 * 60 * 60,
+        memoryBytes: Int         = 128 * 1024 * 1024,
+        diskBytes: Int64         = 512 * 1024 * 1024,
+        diskPathName: String     = "ImageKitCache",
+        defaultTTL: TimeInterval = 4 * 60 * 60,
         sessionConfiguration: URLSessionConfiguration = {
             let c = URLSessionConfiguration.default
             c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData // we manage caching
             c.urlCache = nil
             c.httpMaximumConnectionsPerHost = 6
-            c.timeoutIntervalForRequest = 30
-            c.timeoutIntervalForResource = 120
+            c.timeoutIntervalForRequest     = 30
+            c.timeoutIntervalForResource    = 120
             return c
         }(),
         accepts: String = "image/avif,image/webp,image/*;q=0.8"
     ) {
-        self.memoryBytes = memoryBytes
-        self.diskBytes = diskBytes
-        self.diskPathName = diskPathName
-        self.defaultTTL = defaultTTL
+        self.memoryBytes          = memoryBytes
+        self.diskBytes            = diskBytes
+        self.diskPathName         = diskPathName
+        self.defaultTTL           = defaultTTL
         self.sessionConfiguration = sessionConfiguration
-        self.accepts = accepts
+        self.accepts              = accepts
     }
 }
 
@@ -651,6 +651,89 @@ public struct AsyncImageView<Placeholder: View>: View {
                 }
             }
         }
+    }
+}
+#endif
+
+//
+//  ImageKit+UIKit.swift
+//  UIKit helpers for ImageKit
+//
+//  Drop this next to ImageKit.swift (same module).
+//
+
+#if canImport(UIKit)
+import UIKit
+
+private var ik_taskKey: UInt8 = 0
+
+extension UIImageView {
+    // MARK: - Associated Task (for cancellation on reuse)
+    private var ik_task: Task<Void, Never>? {
+        get { objc_getAssociatedObject(self, &ik_taskKey) as? Task<Void, Never> }
+        set { objc_setAssociatedObject(self, &ik_taskKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    /// Load and display a remote image using ImageKit.
+    /// - Parameters:
+    ///   - url: Remote URL. If `nil`, sets `placeholder` and returns.
+    ///   - placeholder: Optional placeholder to show immediately.
+    ///   - targetSize: If `nil`, the view’s current `bounds.size` is used (on main actor).
+    ///   - scale: Usually leave `nil` (uses `UIScreen.main.scale` safely inside the pipeline).
+    ///   - animated: Cross-dissolve in on success (default `true`).
+    public func ik_setImage(
+        url: URL?,
+        placeholder: UIImage? = nil,
+        targetSize: CGSize? = nil,
+        scale: CGFloat? = nil,
+        animated: Bool = true
+    ) {
+        // Cancel any previous in-flight task (important for reused cells)
+        ik_task?.cancel()
+        ik_task = nil
+
+        // Reset UI state
+        if let placeholder { self.image = placeholder }
+
+        guard let url else { return }
+
+        ik_task = Task { [weak self] in
+            guard let self else { return }
+            // Resolve a sensible target size on main actor if not provided
+            let size: CGSize = await MainActor.run { [weak self] in
+                guard let self else { return targetSize ?? .zero }
+                let s = targetSize ?? self.bounds.size
+                return s == .zero ? CGSize(width: 200, height: 200) : s // fallback to avoid 0x0 decoding
+            }
+
+            do {
+                let ui = try await ImageKit.shared.uiImage(
+                    for: url,
+                    targetSize: size,
+                    scale: scale,
+                    ttl: nil // uses library default (4h)
+                )
+                // Apply on main with optional fade
+                await MainActor.run { [weak self] in
+                    guard let self, self.ik_task?.isCancelled == false else { return }
+                    if animated {
+                        UIView.transition(with: self, duration: 0.25, options: .transitionCrossDissolve) {
+                            self.image = ui
+                        }
+                    } else {
+                        self.image = ui
+                    }
+                }
+            } catch {
+                // Keep placeholder on failure (you can log if needed)
+            }
+        }
+    }
+
+    /// Cancel the current image request (call from `prepareForReuse()`).
+    public func ik_cancelImageLoad() {
+        ik_task?.cancel()
+        ik_task = nil
     }
 }
 #endif
