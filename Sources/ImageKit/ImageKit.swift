@@ -14,7 +14,6 @@
 //
 
 import Foundation
-import UIKit
 import CryptoKit
 import ImageIO
 
