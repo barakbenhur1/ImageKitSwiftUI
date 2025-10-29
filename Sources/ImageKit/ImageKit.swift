@@ -665,77 +665,150 @@ public struct AsyncImageView<Placeholder: View>: View {
 #if canImport(UIKit)
 import UIKit
 
-private var ik_taskKey: UInt8 = 0
+/// UIKit async image view backed by ImageKit (4h default TTL).
+/// - Shows placeholder immediately
+/// - Downsamples to this view's size
+/// - Cancels on reuse / deinit
+public final class AsyncUIImageView: UIView {
 
-extension UIImageView {
-    // MARK: - Associated Task (for cancellation on reuse)
-    private var ik_task: Task<Void, Never>? {
-        get { objc_getAssociatedObject(self, &ik_taskKey) as? Task<Void, Never> }
-        set { objc_setAssociatedObject(self, &ik_taskKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    // MARK: API
+
+    /// Set or change the image URL (reloads).
+    public var url: URL? { didSet { load() } }
+
+    /// Optional placeholder image (shown until load succeeds).
+    public var placeholder: UIImage? { didSet { imageView.image = placeholder } }
+
+    /// Optional TTL override for this view (default: nil → uses ImageKit's 4h).
+    public var ttl: TimeInterval?
+
+    /// Cross-dissolve on success (default true).
+    public var animated: Bool = true
+
+    /// Forward content mode to the inner image view.
+    public override var contentMode: UIView.ContentMode {
+        didSet { imageView.contentMode = contentMode }
     }
 
-    /// Load and display a remote image using ImageKit.
-    /// - Parameters:
-    ///   - url: Remote URL. If `nil`, sets `placeholder` and returns.
-    ///   - placeholder: Optional placeholder to show immediately.
-    ///   - targetSize: If `nil`, the view’s current `bounds.size` is used (on main actor).
-    ///   - scale: Usually leave `nil` (uses `UIScreen.main.scale` safely inside the pipeline).
-    ///   - animated: Cross-dissolve in on success (default `true`).
-    public func ik_setImage(
-        url: URL?,
-        placeholder: UIImage? = nil,
-        targetSize: CGSize? = nil,
-        scale: CGFloat? = nil,
-        animated: Bool = true
-    ) {
-        // Cancel any previous in-flight task (important for reused cells)
-        ik_task?.cancel()
-        ik_task = nil
+    // MARK: Internals
 
-        // Reset UI state
-        if let placeholder { self.image = placeholder }
+    private let imageView = UIImageView()
+    private let indicator = UIActivityIndicatorView(style: .medium)
+    private var loadTask: Task<Void, Never>?
+    private var lastTargetSize: CGSize = .zero
 
-        guard let url else { return }
+    // MARK: Init
 
-        ik_task = Task { [weak self] in
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        commonInit()
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        clipsToBounds = true
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.clipsToBounds = true
+        imageView.contentMode = .scaleAspectFill
+
+        indicator.translatesAutoresizingMaskIntoConstraints = false
+        indicator.hidesWhenStopped = true
+
+        addSubview(imageView)
+        addSubview(indicator)
+
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            indicator.centerXAnchor.constraint(equalTo: centerXAnchor),
+            indicator.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    deinit { cancel() }
+
+    // MARK: Public helpers
+
+    /// Convenience setter.
+    public func set(url: URL?, placeholder: UIImage? = nil, ttl: TimeInterval? = nil) {
+        self.placeholder = placeholder
+        self.ttl = ttl
+        self.url = url
+    }
+
+    /// Cancel any in-flight load (call from `prepareForReuse()`).
+    public func cancel() {
+        loadTask?.cancel()
+        loadTask = nil
+    }
+
+    // MARK: Loading
+
+    private func load() {
+        // Cancel previous request and reset UI
+        cancel()
+        imageView.image = placeholder
+
+        guard let url = url else { return }
+
+        indicator.startAnimating()
+
+        let target = resolvedTargetSize()
+        lastTargetSize = target
+
+        loadTask = Task { [weak self] in
             guard let self else { return }
-            // Resolve a sensible target size on main actor if not provided
-            let size: CGSize = await MainActor.run { [weak self] in
-                guard let self else { return targetSize ?? .zero }
-                let s = targetSize ?? self.bounds.size
-                return s == .zero ? CGSize(width: 200, height: 200) : s // fallback to avoid 0x0 decoding
-            }
-
             do {
-                let ui = try await ImageKit.shared.uiImage(
+                let img = try await ImageKit.shared.uiImage(
                     for: url,
-                    targetSize: size,
-                    scale: scale,
-                    ttl: nil // uses library default (4h)
+                    targetSize: target,   // downsample to our bounds
+                    scale: nil,           // uses UIScreen.main.scale internally
+                    ttl: ttl              // nil → default 4h
                 )
-                // Apply on main with optional fade
-                await MainActor.run { [weak self] in
-                    guard let self, self.ik_task?.isCancelled == false else { return }
-                    if animated {
-                        UIView.transition(with: self, duration: 0.25, options: .transitionCrossDissolve) {
-                            self.image = ui
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.indicator.stopAnimating()
+                    if self.animated {
+                        UIView.transition(with: self.imageView, duration: 0.25, options: .transitionCrossDissolve) {
+                            self.imageView.image = img
                         }
                     } else {
-                        self.image = ui
+                        self.imageView.image = img
                     }
                 }
             } catch {
-                // Keep placeholder on failure (you can log if needed)
+                await MainActor.run { self.indicator.stopAnimating() }
+                // keep placeholder on failure
             }
         }
     }
 
-    /// Cancel the current image request (call from `prepareForReuse()`).
-    public func ik_cancelImageLoad() {
-        ik_task?.cancel()
-        ik_task = nil
+    private func resolvedTargetSize() -> CGSize {
+        layoutIfNeeded()
+        var size = bounds.size
+        if size == .zero { size = CGSize(width: 200, height: 200) } // fallback to avoid 0×0 decode
+        return size
+    }
+
+    // If the view’s size changes notably (e.g., after layout), re-request a properly downsampled image.
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        let newSize = bounds.size
+        if url != nil, newSize != .zero,
+           abs(newSize.width - lastTargetSize.width) > 1 || abs(newSize.height - lastTargetSize.height) > 1 {
+            load()
+        }
     }
 }
+
 #endif
 
 // ===============================================================
