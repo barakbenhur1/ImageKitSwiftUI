@@ -118,7 +118,6 @@ public struct ImageKitConfiguration: Sendable {
         self.defaultTTL           = defaultTTL
         self.accepts              = accepts
         self.memoryTTL            = memoryTTL
-        
         self.sessionConfiguration = sessionConfiguration ?? {
             let c = URLSessionConfiguration.default
             c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -573,6 +572,7 @@ public struct AsyncImageView<Placeholder: View>: View {
     
     @State private var uiImage: UIImage?
     @State private var isLoading = false
+    @State private var didFail = false
     
     public init(url: URL?, @ViewBuilder placeholder: @escaping () -> Placeholder) {
         self.url = url
@@ -585,11 +585,15 @@ public struct AsyncImageView<Placeholder: View>: View {
                 if let img = uiImage {
                     #if canImport(UIKit)
                     Image(uiImage: img).resizable().scaledToFit()
-                    #else
+#else
                     Image(nsImage: img).resizable().scaledToFit()
-                    #endif
+#endif
                 } else {
-                    placeholder()
+                    if didFail {
+                        unavailableView()
+                    } else {
+                        placeholder()
+                    }
                 }
             }
             .clipped()
@@ -605,14 +609,29 @@ public struct AsyncImageView<Placeholder: View>: View {
                         scale: nil,
                         ttl: nil
                     )
-                    withAnimation(.easeIn(duration: 0.15)) { self.uiImage = img }
+                    withAnimation(.easeIn(duration: 0.15)) {
+                        self.uiImage = img
+                        self.didFail = false
+                    }
                 } catch ImageKitError.cancelled {
                     // benign on refresh/scroll reuse
                 } catch {
-                    // keep placeholder
+                    withAnimation(.easeIn(duration: 0.15)) { self.didFail = true }
                 }
             }
         }
+    }
+    
+    @ViewBuilder
+    private func unavailableView() -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .imageScale(.large)
+            Text("Image unavailable")
+                .font(.footnote.weight(.semibold))
+        }
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Image unavailable")
     }
 }
 #endif
