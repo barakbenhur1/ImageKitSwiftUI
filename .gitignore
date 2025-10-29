@@ -1,0 +1,24 @@
+# Xcode / Swift
+DerivedData/
+build/
+*.xccheckout
+*.xcscmblueprint
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+xcuserdata/
+*.moved-aside
+
+# SwiftPM
+.swiftpm/
+Packages/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# SPM binaries (if any)
+/.build/
