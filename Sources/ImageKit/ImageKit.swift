@@ -13,6 +13,13 @@
 //  - Manual cache invalidation (global + per-URL)
 //
 
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+public typealias UIImage = NSImage // allow the same API name across macOS
+#endif
+
 import Foundation
 import CryptoKit
 import ImageIO
