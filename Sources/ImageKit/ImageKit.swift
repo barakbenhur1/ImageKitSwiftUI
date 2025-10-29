@@ -3,7 +3,8 @@
 //  Created by Barak Ben Hur on 29/10/2025.
 //
 //  Cross-platform (iOS + macOS) image loading library with persistent disk cache,
-//  downsampling, and manual cache invalidation. Zero third-party SDKs.
+//  downsampling, ETag/Last-Modified validation, and manual cache invalidation.
+//  Now with per-entry disk TTL (from Cache-Control) and memory TTL.
 //
 //  Features
 //  - Memory + disk cache (Application Support, excluded from backup) with LRU trimming
@@ -11,6 +12,9 @@
 //  - Downsampling to target view size for low memory usage
 //  - SwiftUI: AsyncImageView(url:placeholder:)
 //  - UIKit: AsyncUIImageView
+//  - TTL:
+//      * Disk item freshness = override `ttl` ?? HTTP Cache-Control:max-age ?? `defaultTTL`
+//      * Memory TTL = `memoryTTL` (config) or falls back to effective disk TTL
 //  - Manual cache invalidation (global + per-URL)
 //
 
@@ -91,19 +95,31 @@ public extension HTTPURLResponse {
 // ===============================================================
 
 public struct ImageKitConfiguration: Sendable {
-    public var memoryBytes: Int
-    public var diskBytes: Int64
-    public var diskPathName: String
-    public var defaultTTL: TimeInterval
+    public var memoryBytes: Int                 // NSCache budget (bytes)
+    public var diskBytes: Int64                 // Disk budget (bytes)
+    public var diskPathName: String             // Folder name under Application Support
+    public var defaultTTL: TimeInterval         // Default disk TTL if server gives none
     public var sessionConfiguration: URLSessionConfiguration
-    public var accepts: String
+    public var accepts: String                  // Accept header
+    public var memoryTTL: TimeInterval?         // Optional RAM TTL (nil → use effective disk TTL)
     
     public init(
         memoryBytes: Int         = 128 * 1024 * 1024,
         diskBytes: Int64         = 512 * 1024 * 1024,
         diskPathName: String     = "ImageKitCache",
         defaultTTL: TimeInterval = 4 * 60 * 60, // 4h
-        sessionConfiguration: URLSessionConfiguration = {
+        sessionConfiguration: URLSessionConfiguration? = nil,
+        accepts: String = "image/avif,image/webp,image/*;q=0.8",
+        memoryTTL: TimeInterval? = nil
+    ) {
+        self.memoryBytes          = memoryBytes
+        self.diskBytes            = diskBytes
+        self.diskPathName         = diskPathName
+        self.defaultTTL           = defaultTTL
+        self.accepts              = accepts
+        self.memoryTTL            = memoryTTL
+        
+        self.sessionConfiguration = sessionConfiguration ?? {
             let c = URLSessionConfiguration.default
             c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             c.urlCache = nil
@@ -111,15 +127,7 @@ public struct ImageKitConfiguration: Sendable {
             c.timeoutIntervalForRequest     = 30
             c.timeoutIntervalForResource    = 120
             return c
-        }(),
-        accepts: String = "image/avif,image/webp,image/*;q=0.8"
-    ) {
-        self.memoryBytes          = memoryBytes
-        self.diskBytes            = diskBytes
-        self.diskPathName         = diskPathName
-        self.defaultTTL           = defaultTTL
-        self.sessionConfiguration = sessionConfiguration
-        self.accepts              = accepts
+        }()
     }
 }
 
@@ -176,7 +184,7 @@ public final class Pipeline: @unchecked Sendable {
         for url: URL,
         targetSize: CGSize? = nil,
         scale: CGFloat? = nil,
-        ttl: TimeInterval? = nil
+        ttl: TimeInterval? = nil          // per-call override for disk freshness
     ) async throws -> UIImage {
         if Task.isCancelled { throw ImageKitError.cancelled }
         
@@ -186,28 +194,40 @@ public final class Pipeline: @unchecked Sendable {
         }()
         
         let mKey = MemoryCache.Key(url: url, targetSize: targetSize, scale: resolvedScale)
+        
+        // Memory fast path (TTL-aware)
         if let cached = await self.memory.image(for: mKey) { return cached }
         
         return try await self.inflight.run(key: mKey.cacheKey) {
-            // Disk fast path
+            // Disk path
             if let candidate = try await self.disk.read(url: url) {
-                let freshEnough = candidate.isFresh(now: Date(), ttl: ttl ?? self.config.defaultTTL)
+                // Effective disk TTL: param > Cache-Control:max-age > default
+                let effDiskTTL = ttl ?? candidate.meta.cacheTTL ?? self.config.defaultTTL
+                let freshEnough = candidate.isFresh(now: Date(), ttl: effDiskTTL)
                 let wantsRefresh = !freshEnough
+                
                 if let ui = candidate.decodeDownsampled(to: targetSize, scale: resolvedScale) {
-                    await self.memory.insert(ui, for: mKey)
+                    let memTTL = self.config.memoryTTL ?? effDiskTTL
+                    await self.memory.insert(ui, for: mKey, ttl: memTTL)
+                    
                     if wantsRefresh {
+                        // async background refresh; keep served image
                         Task { try? await self.refetch(url: url) }
                     }
                     return ui
                 }
             }
-            // Network
-            let (data, meta) = try await self.fetch(url: url)
+            
+            // Network path
+            let (data, meta) = try await self.fetch(url: url)  // meta may contain cacheTTL
             try await self.disk.write(url: url, data: data, meta: meta)
+            
             guard let ui = DiskCache.Decoded.decode(data: data, targetSize: targetSize, scale: resolvedScale) else {
                 throw ImageKitError.decodingFailed
             }
-            await self.memory.insert(ui, for: mKey)
+            let effDiskTTL = ttl ?? meta.cacheTTL ?? self.config.defaultTTL
+            let memTTL = self.config.memoryTTL ?? effDiskTTL
+            await self.memory.insert(ui, for: mKey, ttl: memTTL)
             return ui
         }
     }
@@ -219,7 +239,7 @@ public final class Pipeline: @unchecked Sendable {
     
     public func invalidate(url: URL) async {
         try? await self.disk.remove(url: url)
-        await self.memory.removeAll()
+        await self.memory.removeAll() // conservative: drop all RAM variants
     }
     
     public func prefetch(urls: [URL], maxConcurrent: Int = 4) async {
@@ -261,7 +281,7 @@ public final class Pipeline: @unchecked Sendable {
             return (data, meta)
         case .some(.notModified):
             if let cached = try await self.disk.read(url: url) {
-                try await self.disk.touch(url: url)
+                try await self.disk.touch(url: url)           // refresh lastAccess
                 return (cached.data, cached.meta)
             }
             fallthrough
@@ -274,7 +294,7 @@ public final class Pipeline: @unchecked Sendable {
 }
 
 // ===============================================================
-// MARK: - Memory Cache (NSCache)
+// MARK: - Memory Cache (NSCache) with TTL
 // ===============================================================
 
 final class MemoryCache: @unchecked Sendable {
@@ -288,19 +308,36 @@ final class MemoryCache: @unchecked Sendable {
         }
         var cacheKey: String { url.absoluteString + "|" + variant }
     }
-    private final class Box: NSObject { let image: UIImage; init(_ i: UIImage) { image = i } }
+    
+    private final class Box: NSObject {
+        let image: UIImage
+        let expiresAt: Date
+        init(_ i: UIImage, expiresAt: Date) { self.image = i; self.expiresAt = expiresAt }
+    }
+    
     private let cache = NSCache<NSString, Box>()
     
     func setCostLimit(_ bytes: Int) { cache.totalCostLimit = bytes }
-    func image(for key: Key) async -> UIImage? { cache.object(forKey: key.cacheKey as NSString)?.image }
-    func insert(_ image: UIImage, for key: Key) async {
-        cache.setObject(Box(image), forKey: key.cacheKey as NSString, cost: image.ikCost)
+    
+    func image(for key: Key) async -> UIImage? {
+        guard let box = cache.object(forKey: key.cacheKey as NSString) else { return nil }
+        guard box.expiresAt < Date() else {
+            cache.removeObject(forKey: key.cacheKey as NSString) // expired
+            return nil
+        }
+        return box.image
     }
+    
+    func insert(_ image: UIImage, for key: Key, ttl: TimeInterval) async {
+        let box = Box(image, expiresAt: Date().addingTimeInterval(ttl))
+        cache.setObject(box, forKey: key.cacheKey as NSString, cost: image.ikCost)
+    }
+    
     func removeAll() async { cache.removeAllObjects() }
 }
 
 // ===============================================================
-// MARK: - Disk Cache (Application Support)
+// MARK: - Disk Cache (Application Support) with per-entry TTL
 // ===============================================================
 
 actor DiskCache {
@@ -311,9 +348,9 @@ actor DiskCache {
         var lastAccess: Date
         var size: Int
         var created: Date
+        var cacheTTL: TimeInterval?    // from Cache-Control:max-age
         
         static func from(http: HTTPURLResponse) -> Meta {
-            // Use case-insensitive lookup from allHeaderFields (no availability issues)
             let headers = http.allHeaderFields
             func hdr(_ name: String) -> String? {
                 for (k, v) in headers {
@@ -323,13 +360,23 @@ actor DiskCache {
                 }
                 return nil
             }
+            // Parse Cache-Control: max-age=####
+            var ttlFromCacheControl: TimeInterval? = nil
+            if let cc = hdr("Cache-Control")?.lowercased() {
+                if let r = cc.range(of: "max-age=") {
+                    let rest = cc[r.upperBound...]
+                    let digits = rest.prefix { $0.isNumber }
+                    if let secs = TimeInterval(digits) { ttlFromCacheControl = secs }
+                }
+            }
             return Meta(
                 etag: hdr("Etag"),
                 lastModified: hdr("Last-Modified"),
                 contentType: hdr("Content-Type"),
                 lastAccess: Date(),
                 size: Int(http.expectedContentLength > 0 ? http.expectedContentLength : 0),
-                created: Date()
+                created: Date(),
+                cacheTTL: ttlFromCacheControl
             )
         }
         func validators() -> (etag: String?, lastModified: String?)? { (etag, lastModified) }
@@ -368,7 +415,10 @@ actor DiskCache {
             return UIImage(data: data)
             #endif
         }
-        func isFresh(now: Date, ttl: TimeInterval) -> Bool { now.timeIntervalSince(meta.lastAccess) < ttl }
+        /// Freshness check for disk (age since lastAccess).
+        func isFresh(now: Date, ttl: TimeInterval) -> Bool {
+            now.timeIntervalSince(meta.lastAccess) < ttl
+        }
     }
     
     private let fm = FileManager()
@@ -413,8 +463,10 @@ actor DiskCache {
         if let meta = try? JSONDecoder.iso8601.decode(Meta.self, from: Data(contentsOf: mURL)) {
             return Decoded(data: data, meta: meta)
         } else {
+            // tolerate missing meta
             let basic = Meta(etag: nil, lastModified: nil, contentType: nil,
-                             lastAccess: Date(), size: data.count, created: Date())
+                             lastAccess: Date(), size: data.count, created: Date(),
+                             cacheTTL: nil)
             return Decoded(data: data, meta: basic)
         }
     }
@@ -459,7 +511,7 @@ actor DiskCache {
             entries.append((u, date, size))
         }
         if total <= sizeLimit { return }
-        entries.sort { $0.date < $1.date } // LRU
+        entries.sort { $0.date < $1.date } // LRU-ish via mod date
         for e in entries {
             try? fm.removeItem(at: e.url)
             let mURL = e.url.deletingPathExtension().appendingPathExtension("json")
