@@ -630,6 +630,7 @@ public struct AsyncImageView<Placeholder: View>: View {
             Text("Image unavailable")
                 .font(.footnote.weight(.semibold))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .foregroundStyle(.secondary)
         .accessibilityLabel("Image unavailable")
     }
