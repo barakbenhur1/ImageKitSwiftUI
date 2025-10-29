@@ -2,7 +2,7 @@
 //  ImageKit.swift
 //  Created by Barak Ben Hur on 29/10/2025.
 //
-//  SwiftUI-first image loading library with persistent disk cache,
+//  Cross-platform (iOS + macOS) image loading library with persistent disk cache,
 //  downsampling, and manual cache invalidation. Zero third-party SDKs.
 //
 //  Features
@@ -10,14 +10,28 @@
 //  - ETag / Last-Modified validation (304 support)
 //  - Downsampling to target view size for low memory usage
 //  - SwiftUI: AsyncImageView(url:placeholder:)
+//  - UIKit: AsyncUIImageView
 //  - Manual cache invalidation (global + per-URL)
 //
 
 #if canImport(UIKit)
 import UIKit
+private typealias PlatformImage = UIImage
+@inline(__always) private func _platformScale() -> CGFloat { UIScreen.main.scale }
+private extension UIImage { var ikCost: Int { Int(size.width * size.height * scale * scale) * 4 } }
+@inline(__always) private func _makeImage(from cg: CGImage, scale: CGFloat) -> UIImage {
+    UIImage(cgImage: cg, scale: scale, orientation: .up)
+}
+
 #elseif canImport(AppKit)
 import AppKit
-public typealias UIImage = NSImage // allow the same API name across macOS
+public typealias UIImage = NSImage // keep external API type name
+private typealias PlatformImage = NSImage
+@inline(__always) private func _platformScale() -> CGFloat { NSScreen.main?.backingScaleFactor ?? 2.0 }
+private extension NSImage { var ikCost: Int { Int(size.width * size.height) * 4 } }
+@inline(__always) private func _makeImage(from cg: CGImage, scale: CGFloat) -> NSImage {
+    NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+}
 #endif
 
 import Foundation
@@ -28,9 +42,7 @@ import ImageIO
 // MARK: - Public Facade
 // ===============================================================
 
-/// Entry point to the library.
 public enum ImageKit {
-    /// Shared pipeline (configurable if you add your own initializer).
     public static let shared = Pipeline()
 }
 
@@ -38,7 +50,6 @@ public enum ImageKit {
 // MARK: - Errors
 // ===============================================================
 
-/// Library error domain.
 public enum ImageKitError: Error, LocalizedError {
     case badStatusCode(Int)
     case cancelled
@@ -60,24 +71,16 @@ public enum ImageKitError: Error, LocalizedError {
 // MARK: - HTTP Status (simple)
 
 public enum HTTPStatus: Int, Sendable, CustomStringConvertible {
-    case ok          = 200
-    case notModified = 304
-    case notFound    = 404
-
+    case ok = 200, notModified = 304, notFound = 404
     public var description: String {
         switch self {
-        case .ok:          return "OK"
-        case .notModified: return "Not Modified"
-        case .notFound:    return "Not Found"
+        case .ok: return "OK"; case .notModified: return "Not Modified"; case .notFound: return "Not Found"
         }
     }
 }
 
 public extension HTTPURLResponse {
-    /// Map to our simple status set (nil if it's not 200/304/404).
     var status: HTTPStatus? { HTTPStatus(rawValue: statusCode) }
-
-    // Quick predicates, if you prefer them:
     var isOK: Bool { statusCode == HTTPStatus.ok.rawValue }
     var isNotModified: Bool { statusCode == HTTPStatus.notModified.rawValue }
     var isNotFound: Bool { statusCode == HTTPStatus.notFound.rawValue }
@@ -87,29 +90,22 @@ public extension HTTPURLResponse {
 // MARK: - Configuration
 // ===============================================================
 
-/// Runtime configuration for the image pipeline.
 public struct ImageKitConfiguration: Sendable {
-    /// In-memory cache budget in bytes (approximate).
-    public var memoryBytes: Int            // e.g., 128 MB
-    /// On-disk cache budget in bytes (hard limit; LRU trim).
-    public var diskBytes: Int64            // e.g., 512 MB
-    /// Folder name inside Application Support.
-    public var diskPathName: String        // e.g., "ImageKitCache"
-    /// Default freshness horizon. If older and 304 validators are missing, a refresh is attempted.
-    public var defaultTTL: TimeInterval    // e.g., 30 days
-    /// URLSession configuration (we manage caching ourselves).
+    public var memoryBytes: Int
+    public var diskBytes: Int64
+    public var diskPathName: String
+    public var defaultTTL: TimeInterval
     public var sessionConfiguration: URLSessionConfiguration
-    /// Accept header to prefer modern formats when available.
     public var accepts: String
     
     public init(
         memoryBytes: Int         = 128 * 1024 * 1024,
         diskBytes: Int64         = 512 * 1024 * 1024,
         diskPathName: String     = "ImageKitCache",
-        defaultTTL: TimeInterval = 4 * 60 * 60,
+        defaultTTL: TimeInterval = 4 * 60 * 60, // 4h
         sessionConfiguration: URLSessionConfiguration = {
             let c = URLSessionConfiguration.default
-            c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData // we manage caching
+            c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             c.urlCache = nil
             c.httpMaximumConnectionsPerHost = 6
             c.timeoutIntervalForRequest     = 30
@@ -128,62 +124,53 @@ public struct ImageKitConfiguration: Sendable {
 }
 
 // ===============================================================
+// MARK: - URLSession async fallback (macOS < 12 / iOS < 15)
+// ===============================================================
+
+private extension URLSession {
+    func ikData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        #if canImport(UIKit)
+        if #available(iOS 15, tvOS 15, watchOS 8, *) {
+            return try await data(for: request, delegate: nil)
+        }
+        #elseif canImport(AppKit)
+        if #available(macOS 12, *) {
+            return try await data(for: request, delegate: nil)
+        }
+        #endif
+        return try await withCheckedThrowingContinuation { cont in
+            let task = self.dataTask(with: request) { data, resp, err in
+                if let err = err { cont.resume(throwing: err); return }
+                guard let data = data, let resp = resp else {
+                    cont.resume(throwing: ImageKitError.missingData); return
+                }
+                cont.resume(returning: (data, resp))
+            }
+            task.resume()
+        }
+    }
+}
+
+// ===============================================================
 // MARK: - Pipeline
 // ===============================================================
 
-/// Fetch/decode pipeline with coalescing, memory+disk cache, and validation.
 public final class Pipeline: @unchecked Sendable {
-    
-    // -----------------------------------------------------------
-    // MARK: Public State
-    // -----------------------------------------------------------
-    
-    /// Effective configuration currently in use.
     public let config: ImageKitConfiguration
-    
-    // -----------------------------------------------------------
-    // MARK: Private State
-    // -----------------------------------------------------------
-    
     private let session: URLSession
     private let memory = MemoryCache()
     private let disk: DiskCache
     private let inflight = Inflight()
     
-    // -----------------------------------------------------------
-    // MARK: Init / Deinit
-    // -----------------------------------------------------------
-    
-    /// Create a pipeline.
-    /// - Parameter config: The configuration to use (see `ImageKitConfiguration`).
     public init(config: ImageKitConfiguration = .init()) {
         self.config  = config
         self.session = URLSession(configuration: config.sessionConfiguration)
         self.disk    = DiskCache(pathName: config.diskPathName, sizeLimit: config.diskBytes, defaultTTL: config.defaultTTL)
         memory.setCostLimit(config.memoryBytes)
     }
-    
     deinit { session.invalidateAndCancel() }
     
-    // -----------------------------------------------------------
-    // MARK: Public API
-    // -----------------------------------------------------------
-    
-    /// Load and decode a `UIImage`. Safe to call off the main actor.
-    ///
-    /// The method:
-    /// 1. Checks the in-memory cache for a downsampled variant.
-    /// 2. If missing, attempts to read original bytes from disk, decodes (downsampled to `targetSize`) and returns immediately.
-    /// 3. If the disk item is stale per TTL, a network refresh is performed opportunistically.
-    /// 4. If not on disk, fetches the bytes from the network (using ETag/Last-Modified when available), writes to disk, decodes and caches in memory.
-    ///
-    /// - Parameters:
-    ///   - url: Remote image URL.
-    ///   - targetSize: Desired render size in **points** (e.g., the SwiftUI view size). Decoding is downsampled to this size.
-    ///   - scale: Display scale to combine with `targetSize` (defaults to `UIScreen.main.scale`, resolved safely on main actor).
-    ///   - ttl: Optional TTL override for this request. If not provided, `config.defaultTTL` is used.
-    /// - Returns: A decoded `UIImage`.
-    /// - Throws: `ImageKitError` on network/decoding failures.
+    // Load & decode
     @discardableResult
     public func uiImage(
         for url: URL,
@@ -193,34 +180,30 @@ public final class Pipeline: @unchecked Sendable {
     ) async throws -> UIImage {
         if Task.isCancelled { throw ImageKitError.cancelled }
         
-        // Resolve device scale on the main actor only if needed
-        let resolvedScale: CGFloat
-        if let s = scale {
-            resolvedScale = s
-        } else {
-            resolvedScale = await MainActor.run { UIScreen.main.scale }
-        }
+        let resolvedScale: CGFloat = await {
+            if let s = scale { return s }
+            return await MainActor.run { _platformScale() }
+        }()
         
         let mKey = MemoryCache.Key(url: url, targetSize: targetSize, scale: resolvedScale)
         if let cached = await self.memory.image(for: mKey) { return cached }
         
         return try await self.inflight.run(key: mKey.cacheKey) {
-            // 1) Disk fast path (decode + optional background refresh)
+            // Disk fast path
             if let candidate = try await self.disk.read(url: url) {
                 let freshEnough = candidate.isFresh(now: Date(), ttl: ttl ?? self.config.defaultTTL)
                 let wantsRefresh = !freshEnough
-                
                 if let ui = candidate.decodeDownsampled(to: targetSize, scale: resolvedScale) {
                     await self.memory.insert(ui, for: mKey)
-                    if wantsRefresh { Task { try? await self.refetch(url: url) } }
+                    if wantsRefresh {
+                        Task { try? await self.refetch(url: url) }
+                    }
                     return ui
                 }
             }
-            
-            // 2) Network fetch (with validators when present)
+            // Network
             let (data, meta) = try await self.fetch(url: url)
             try await self.disk.write(url: url, data: data, meta: meta)
-            
             guard let ui = DiskCache.Decoded.decode(data: data, targetSize: targetSize, scale: resolvedScale) else {
                 throw ImageKitError.decodingFailed
             }
@@ -229,23 +212,16 @@ public final class Pipeline: @unchecked Sendable {
         }
     }
     
-    /// Remove **both** memory and disk caches.
     public func invalidateAll() async {
         await self.memory.removeAll()
         try? await self.disk.removeAll()
     }
     
-    /// Remove a **single URL** from disk (best-effort) and drop memory cache.
-    /// - Parameter url: The image URL to evict.
     public func invalidate(url: URL) async {
         try? await self.disk.remove(url: url)
-        await self.memory.removeAll() // conservative: ensure no stale variant remains
+        await self.memory.removeAll()
     }
     
-    /// Prefetch a list of URLs into disk (and memory if decoded as part of the pipeline).
-    /// - Parameters:
-    ///   - urls: URLs to prefetch.
-    ///   - maxConcurrent: Max concurrent downloads.
     public func prefetch(urls: [URL], maxConcurrent: Int = 4) async {
         await withTaskGroup(of: Void.self) { group in
             let limiter = AsyncSemaphore(value: maxConcurrent)
@@ -260,59 +236,38 @@ public final class Pipeline: @unchecked Sendable {
         }
     }
     
-    /// Trim caches to their budget (disk LRU). Use in background/memory-warning hooks.
-    public func trimCaches() async {
-        try? await self.disk.enforceLimit()
-        // For memory, NSCache is budgeted by `totalCostLimit`; no explicit trim API beyond removal.
-    }
+    public func trimCaches() async { try? await self.disk.enforceLimit() }
+    public func clearMemory() async { await self.memory.removeAll() }
     
-    /// Clear in-memory cache only (keeps disk persistent between launches).
-    public func clearMemory() async {
-        await self.memory.removeAll()
-    }
-    
-    // -----------------------------------------------------------
-    // MARK: Internal Helpers
-    // -----------------------------------------------------------
-    
-    /// Force a refetch and rewrite to disk (used after TTL expiry).
     @discardableResult
-    private func refetch(url: URL) async throws -> (Data, DiskCache.Meta)   {
-        try await fetch(url: url) // write happens in fetch()->disk.write via the UI path
-    }
+    private func refetch(url: URL) async throws -> (Data, DiskCache.Meta) { try await fetch(url: url) }
     
-    /// Perform a network fetch with conditional validators when available.
     private func fetch(url: URL) async throws -> (Data, DiskCache.Meta) {
         var request = URLRequest(url: url)
         request.setValue(config.accepts, forHTTPHeaderField: "Accept")
         
         if let cached = try? await self.disk.read(url: url),
-           let validators = cached.meta.validators() {
-            if let etag   = validators.etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-            if let lm     = validators.lastModified { request.setValue(lm, forHTTPHeaderField: "If-Modified-Since") }
+           let v = cached.meta.validators() {
+            if let etag = v.etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+            if let lm = v.lastModified { request.setValue(lm, forHTTPHeaderField: "If-Modified-Since") }
         }
         
-        let (data, response) = try await session.data(for: request, delegate: nil)
+        let (data, response) = try await session.ikData(for: request)
         guard let http = response as? HTTPURLResponse else { throw ImageKitError.missingData }
         
         switch http.status {
         case .some(.ok):
             let meta = DiskCache.Meta.from(http: http)
             return (data, meta)
-            
         case .some(.notModified):
             if let cached = try await self.disk.read(url: url) {
                 try await self.disk.touch(url: url)
                 return (cached.data, cached.meta)
             }
-            // fall through to treat as error if somehow no local file:
             fallthrough
-            
         case .some(.notFound):
             throw ImageKitError.badStatusCode(http.statusCode)
-            
         case .none:
-            // any other status → treat as error
             throw ImageKitError.badStatusCode(http.statusCode)
         }
     }
@@ -323,52 +278,32 @@ public final class Pipeline: @unchecked Sendable {
 // ===============================================================
 
 final class MemoryCache: @unchecked Sendable {
-    /// Memory key includes the downsample variant (size × scale).
     struct Key: Hashable, Sendable {
         let url: URL
         let variant: String
         init(url: URL, targetSize: CGSize?, scale: CGFloat) {
-            if let s = targetSize {
-                self.variant = "\(Int(s.width * scale))x\(Int(s.height * scale))"
-            } else {
-                self.variant = "orig"
-            }
+            if let s = targetSize { self.variant = "\(Int(s.width * scale))x\(Int(s.height * scale))" }
+            else { self.variant = "orig" }
             self.url = url
         }
         var cacheKey: String { url.absoluteString + "|" + variant }
     }
-    
-    private final class Box: NSObject {
-        let image: UIImage
-        init(_ i: UIImage) { self.image = i }
-    }
-    
+    private final class Box: NSObject { let image: UIImage; init(_ i: UIImage) { image = i } }
     private let cache = NSCache<NSString, Box>()
     
     func setCostLimit(_ bytes: Int) { cache.totalCostLimit = bytes }
     func image(for key: Key) async -> UIImage? { cache.object(forKey: key.cacheKey as NSString)?.image }
     func insert(_ image: UIImage, for key: Key) async {
-        cache.setObject(Box(image), forKey: key.cacheKey as NSString, cost: image.cost)
+        cache.setObject(Box(image), forKey: key.cacheKey as NSString, cost: image.ikCost)
     }
     func removeAll() async { cache.removeAllObjects() }
-}
-
-private extension UIImage {
-    /// Rough RGBA byte estimate for NSCache cost.
-    var cost: Int { Int(size.width * size.height * scale * scale) * 4 }
 }
 
 // ===============================================================
 // MARK: - Disk Cache (Application Support)
 // ===============================================================
 
-/// Actor-isolated disk cache with LRU trimming and HTTP validators.
 actor DiskCache {
-    
-    // -----------------------------------------------------------
-    // MARK: Metadata / Decoded wrappers
-    // -----------------------------------------------------------
-    
     struct Meta: Codable, Sendable {
         var etag: String?
         var lastModified: String?
@@ -378,16 +313,25 @@ actor DiskCache {
         var created: Date
         
         static func from(http: HTTPURLResponse) -> Meta {
-            Meta(
-                etag: http.value(forHTTPHeaderField: "Etag"),
-                lastModified: http.value(forHTTPHeaderField: "Last-Modified"),
-                contentType: http.value(forHTTPHeaderField: "Content-Type"),
+            // Use case-insensitive lookup from allHeaderFields (no availability issues)
+            let headers = http.allHeaderFields
+            func hdr(_ name: String) -> String? {
+                for (k, v) in headers {
+                    if String(describing: k).caseInsensitiveCompare(name) == .orderedSame {
+                        return String(describing: v)
+                    }
+                }
+                return nil
+            }
+            return Meta(
+                etag: hdr("Etag"),
+                lastModified: hdr("Last-Modified"),
+                contentType: hdr("Content-Type"),
                 lastAccess: Date(),
                 size: Int(http.expectedContentLength > 0 ? http.expectedContentLength : 0),
                 created: Date()
             )
         }
-        
         func validators() -> (etag: String?, lastModified: String?)? { (etag, lastModified) }
     }
     
@@ -398,7 +342,6 @@ actor DiskCache {
         func decodeDownsampled(to targetSize: CGSize?, scale: CGFloat) -> UIImage? {
             Self.decode(data: data, targetSize: targetSize, scale: scale)
         }
-        
         static func decode(data: Data, targetSize: CGSize?, scale: CGFloat) -> UIImage? {
             guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
                 return UIImage(data: data)
@@ -418,17 +361,15 @@ actor DiskCache {
             } else {
                 cg = CGImageSourceCreateImageAtIndex(src, 0, opts as CFDictionary)
             }
-            return cg.map { UIImage(cgImage: $0, scale: scale, orientation: .up) } ?? UIImage(data: data)
+            #if canImport(UIKit)
+            return cg.map { _makeImage(from: $0, scale: scale) } ?? UIImage(data: data)
+            #else
+            if let cg = cg { return _makeImage(from: cg, scale: scale) }
+            return UIImage(data: data)
+            #endif
         }
-        
-        func isFresh(now: Date, ttl: TimeInterval) -> Bool {
-            now.timeIntervalSince(meta.lastAccess) < ttl
-        }
+        func isFresh(now: Date, ttl: TimeInterval) -> Bool { now.timeIntervalSince(meta.lastAccess) < ttl }
     }
-    
-    // -----------------------------------------------------------
-    // MARK: Paths & Limits
-    // -----------------------------------------------------------
     
     private let fm = FileManager()
     private let root: URL
@@ -438,27 +379,16 @@ actor DiskCache {
     init(pathName: String, sizeLimit: Int64, defaultTTL: TimeInterval) {
         self.sizeLimit = sizeLimit
         self.defaultTTL = defaultTTL
-        
         let base = try! fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         self.root = base.appendingPathComponent(pathName, isDirectory: true)
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
-        
-        // Exclude from iCloud backup
-        var rv = URLResourceValues()
-        rv.isExcludedFromBackup = true
-        var r = self.root
-        try? r.setResourceValues(rv)
+        var rv = URLResourceValues(); rv.isExcludedFromBackup = true
+        var r = self.root; try? r.setResourceValues(rv)
     }
     
-    // -----------------------------------------------------------
-    // MARK: CRUD
-    // -----------------------------------------------------------
-    
     func key(for url: URL) -> String {
-        let hash = SHA256.hash(data: Data(url.absoluteString.utf8))
-            .compactMap { String(format: "%02x", $0) }
-            .joined()
-        return hash
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
     
     func dataURL(for key: String) -> URL { root.appendingPathComponent(key + ".img") }
@@ -468,13 +398,10 @@ actor DiskCache {
         let key = key(for: url)
         do {
             try data.write(to: dataURL(for: key), options: .atomic)
-            var m = meta
-            m.lastAccess = Date()
+            var m = meta; m.lastAccess = Date()
             let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
             try enc.encode(m).write(to: metaURL(for: key), options: .atomic)
-        } catch {
-            throw ImageKitError.fileIOFailed
-        }
+        } catch { throw ImageKitError.fileIOFailed }
         try enforceLimit()
     }
     
@@ -482,12 +409,10 @@ actor DiskCache {
         let key = key(for: url)
         let dURL = dataURL(for: key)
         let mURL = metaURL(for: key)
-        
         guard let data = try? Data(contentsOf: dURL) else { return nil }
         if let meta = try? JSONDecoder.iso8601.decode(Meta.self, from: Data(contentsOf: mURL)) {
             return Decoded(data: data, meta: meta)
         } else {
-            // Tolerate missing metadata.
             let basic = Meta(etag: nil, lastModified: nil, contentType: nil,
                              lastAccess: Date(), size: data.count, created: Date())
             return Decoded(data: data, meta: basic)
@@ -513,33 +438,28 @@ actor DiskCache {
     func removeAll() throws {
         try fm.removeItem(at: root)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
-        // Re-apply the "do not back up" flag after recreation.
         var rv = URLResourceValues(); rv.isExcludedFromBackup = true
         var r = self.root; try? r.setResourceValues(rv)
     }
     
-    /// Enforce disk size limit by removing least-recently-used files.
     func enforceLimit() throws {
-        var urls = try fm.contentsOfDirectory(
+        let urls = try fm.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: .skipsHiddenFiles
-        )
-        urls = urls.filter { $0.pathExtension == "img" }
+        ).filter { $0.pathExtension == "img" }
         
         var total: Int64 = 0
         var entries: [(url: URL, date: Date, size: Int64)] = []
         for u in urls {
             let res  = try u.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
             let date = res.contentModificationDate ?? Date.distantPast
-            let s    = Int64(res.fileSize ?? 0)
-            total += s
-            entries.append((u, date, s))
+            let size = Int64(res.fileSize ?? 0)
+            total += size
+            entries.append((u, date, size))
         }
-        
         if total <= sizeLimit { return }
-        entries.sort { $0.date < $1.date } // oldest first
-        
+        entries.sort { $0.date < $1.date } // LRU
         for e in entries {
             try? fm.removeItem(at: e.url)
             let mURL = e.url.deletingPathExtension().appendingPathExtension("json")
@@ -558,14 +478,8 @@ private extension JSONDecoder {
 // MARK: - In-Flight Coalescing
 // ===============================================================
 
-/// Deduplicates concurrent requests for the same cache key.
 actor Inflight {
     private var tasks: [String: Task<UIImage, Error>] = [:]
-    
-    /// Run (or join) a task for the given key.
-    /// - Parameters:
-    ///   - key: Unique cache key per (url, variant).
-    ///   - block: Async operation to execute if not already running.
     func run(key: String, _ block: @escaping () async throws -> UIImage) async throws -> UIImage {
         if let existing = tasks[key] { return try await existing.value }
         let t = Task { try await block() }
@@ -579,7 +493,6 @@ actor Inflight {
 // MARK: - Async Semaphore
 // ===============================================================
 
-/// Minimal async semaphore for prefetch concurrency limiting.
 final class AsyncSemaphore: @unchecked Sendable {
     private var value: Int
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -602,21 +515,6 @@ final class AsyncSemaphore: @unchecked Sendable {
 #if canImport(SwiftUI)
 import SwiftUI
 
-/// A lightweight SwiftUI view that downloads, caches, and displays an image.
-/// Uses `ImageKit.shared` internally.
-///
-/// ```swift
-/// AsyncImageView(
-///   url: URL(string: "https://example.com/image.jpg"),
-///   placeholder: { ProgressView() }
-/// )
-/// .frame(width: 220, height: 140)
-/// .clipped()
-/// ```
-///
-/// - Parameters:
-///   - url: The remote image URL (optional).
-///   - placeholder: A view builder used while loading or on failure.
 public struct AsyncImageView<Placeholder: View>: View {
     public let url: URL?
     public let placeholder: () -> Placeholder
@@ -624,7 +522,6 @@ public struct AsyncImageView<Placeholder: View>: View {
     @State private var uiImage: UIImage?
     @State private var isLoading = false
     
-    /// Create an `AsyncImageView`.
     public init(url: URL?, @ViewBuilder placeholder: @escaping () -> Placeholder) {
         self.url = url
         self.placeholder = placeholder
@@ -634,9 +531,11 @@ public struct AsyncImageView<Placeholder: View>: View {
         GeometryReader { geo in
             Group {
                 if let img = uiImage {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFit()
+                    #if canImport(UIKit)
+                    Image(uiImage: img).resizable().scaledToFit()
+                    #else
+                    Image(nsImage: img).resizable().scaledToFit()
+                    #endif
                 } else {
                     placeholder()
                 }
@@ -647,15 +546,18 @@ public struct AsyncImageView<Placeholder: View>: View {
                 if isLoading { return }
                 isLoading = true
                 defer { isLoading = false }
-                
                 do {
-                    let img = try await ImageKit.shared.uiImage(for: url,
-                                                                targetSize: geo.size,
-                                                                scale: nil,
-                                                                ttl: nil)
-                    withAnimation { self.uiImage = img }
+                    let img = try await ImageKit.shared.uiImage(
+                        for: url,
+                        targetSize: geo.size,
+                        scale: nil,
+                        ttl: nil
+                    )
+                    withAnimation(.easeIn(duration: 0.15)) { self.uiImage = img }
+                } catch ImageKitError.cancelled {
+                    // benign on refresh/scroll reuse
                 } catch {
-                    // Keep showing placeholder on failure.
+                    // keep placeholder
                 }
             }
         }
@@ -663,123 +565,83 @@ public struct AsyncImageView<Placeholder: View>: View {
 }
 #endif
 
-//
-//  ImageKit+UIKit.swift
-//  UIKit helpers for ImageKit
-//
-//  Drop this next to ImageKit.swift (same module).
-//
+// ===============================================================
+// MARK: - UIKit Helper View
+// ===============================================================
 
 #if canImport(UIKit)
 import UIKit
 
-/// UIKit async image view backed by ImageKit (4h default TTL).
-/// - Shows placeholder immediately
-/// - Downsamples to this view's size
-/// - Cancels on reuse / deinit
 public final class AsyncUIImageView: UIView {
-
-    // MARK: API
-
-    /// Set or change the image URL (reloads).
     public var url: URL? { didSet { load() } }
-
-    /// Optional placeholder image (shown until load succeeds).
     public var placeholder: UIImage? { didSet { imageView.image = placeholder } }
-
-    /// Optional TTL override for this view (default: nil → uses ImageKit's 4h).
     public var ttl: TimeInterval?
-
-    /// Cross-dissolve on success (default true).
     public var animated: Bool = true
-
-    /// Forward content mode to the inner image view.
     public override var contentMode: UIView.ContentMode {
         didSet { imageView.contentMode = contentMode }
     }
-
-    // MARK: Internals
-
+    
     private let imageView = UIImageView()
     private let indicator = UIActivityIndicatorView(style: .medium)
     private var loadTask: Task<Void, Never>?
     private var lastTargetSize: CGSize = .zero
-
-    // MARK: Init
-
-    public override init(frame: CGRect) {
-        super.init(frame: frame)
-        commonInit()
-    }
-
-    public required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        commonInit()
-    }
-
+    
+    public override init(frame: CGRect) { super.init(frame: frame); commonInit() }
+    public required init?(coder: NSCoder) { super.init(coder: coder); commonInit() }
+    deinit { cancel() }
+    
     private func commonInit() {
         clipsToBounds = true
-
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.clipsToBounds = true
         imageView.contentMode = .scaleAspectFill
-
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.hidesWhenStopped = true
-
-        addSubview(imageView)
-        addSubview(indicator)
-
+        addSubview(imageView); addSubview(indicator)
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
             imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
             imageView.topAnchor.constraint(equalTo: topAnchor),
             imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
-
             indicator.centerXAnchor.constraint(equalTo: centerXAnchor),
             indicator.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
-
-    deinit { cancel() }
-
-    // MARK: Public helpers
-
-    /// Convenience setter.
+    
     public func set(url: URL?, placeholder: UIImage? = nil, ttl: TimeInterval? = nil) {
-        self.placeholder = placeholder
-        self.ttl = ttl
-        self.url = url
+        self.placeholder = placeholder; self.ttl = ttl; self.url = url
     }
-
-    /// Cancel any in-flight load (call from `prepareForReuse()`).
-    public func cancel() {
-        loadTask?.cancel()
-        loadTask = nil
+    public func cancel() { loadTask?.cancel(); loadTask = nil }
+    
+    private func resolvedTargetSize() -> CGSize {
+        layoutIfNeeded()
+        var size = bounds.size
+        if size == .zero { size = CGSize(width: 200, height: 200) }
+        return size
     }
-
-    // MARK: Loading
-
+    
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        let newSize = bounds.size
+        if url != nil, newSize != .zero,
+           abs(newSize.width - lastTargetSize.width) > 1 || abs(newSize.height - lastTargetSize.height) > 1 {
+            load()
+        }
+    }
+    
     private func load() {
-        // Cancel previous request and reset UI
         cancel()
         imageView.image = placeholder
-
         guard let url = url else { return }
-
         indicator.startAnimating()
-
         let target = resolvedTargetSize()
         lastTargetSize = target
-
+        
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let img = try await ImageKit.shared.uiImage(
-                    for: url,
-                    targetSize: target,   // downsample to our bounds
-                    scale: nil,           // uses UIScreen.main.scale internally
-                    ttl: ttl              // nil → default 4h
+                    for: url, targetSize: target, scale: nil, ttl: ttl
                 )
                 if Task.isCancelled { return }
                 await MainActor.run {
@@ -792,45 +654,24 @@ public final class AsyncUIImageView: UIView {
                         self.imageView.image = img
                     }
                 }
+            } catch ImageKitError.cancelled {
+                await MainActor.run { self.indicator.stopAnimating() }
             } catch {
                 await MainActor.run { self.indicator.stopAnimating() }
-                // keep placeholder on failure
             }
         }
     }
-
-    private func resolvedTargetSize() -> CGSize {
-        layoutIfNeeded()
-        var size = bounds.size
-        if size == .zero { size = CGSize(width: 200, height: 200) } // fallback to avoid 0×0 decode
-        return size
-    }
-
-    // If the view’s size changes notably (e.g., after layout), re-request a properly downsampled image.
-    public override func layoutSubviews() {
-        super.layoutSubviews()
-        let newSize = bounds.size
-        if url != nil, newSize != .zero,
-           abs(newSize.width - lastTargetSize.width) > 1 || abs(newSize.height - lastTargetSize.height) > 1 {
-            load()
-        }
-    }
 }
-
 #endif
 
 // ===============================================================
 // MARK: - Lifecycle Helpers
 // ===============================================================
 
-/// Useful app hooks. Call from App/Scene delegate as desired.
 public enum ImageKitLifecycle {
-    /// Free *memory* cache quickly when the OS signals pressure.
     public static func applicationDidReceiveMemoryWarning() {
         Task { await ImageKit.shared.clearMemory() }
     }
-    
-    /// Optionally trim disk LRU on backgrounding (keeps cache persistent).
     public static func applicationDidEnterBackground() {
         Task { await ImageKit.shared.trimCaches() }
     }
