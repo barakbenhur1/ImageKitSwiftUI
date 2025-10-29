@@ -628,7 +628,9 @@ public struct AsyncImageView<Placeholder: View>: View {
         GeometryReader { geo in
             Group {
                 if let img = uiImage {
-                    Image(uiImage: img).resizable().scaledToFill()
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
                 } else {
                     placeholder()
                 }
