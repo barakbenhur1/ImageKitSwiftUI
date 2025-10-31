@@ -14,7 +14,7 @@ private extension UIImage { var ikCost: Int { Int(size.width * size.height * sca
 
 #elseif canImport(AppKit)
 import AppKit
-public typealias UIImage = NSImage // keep external API type name
+public typealias UIImage = NSImage // keep external API type name unified
 private typealias PlatformImage = NSImage
 @inline(__always) private func _platformScale() -> CGFloat { NSScreen.main?.backingScaleFactor ?? 2.0 }
 private extension NSImage { var ikCost: Int { Int(size.width * size.height) * 4 } }
@@ -113,6 +113,7 @@ public struct ImageKitConfiguration: Sendable {
 
 // MARK: - URLSession async fallback
 
+@available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
 private extension URLSession {
     func ikData(for request: URLRequest) async throws -> (Data, URLResponse) {
 #if canImport(UIKit)
@@ -125,7 +126,7 @@ private extension URLSession {
         }
 #endif
         return try await withCheckedThrowingContinuation { cont in
-            let task = dataTask(with: request) { data, resp, err in
+            let task = self.dataTask(with: request) { data, resp, err in
                 if let err = err { cont.resume(throwing: err); return }
                 guard let data = data, let resp = resp else {
                     cont.resume(throwing: ImageKitError.missingData); return
@@ -139,6 +140,7 @@ private extension URLSession {
 
 // MARK: - Pipeline
 
+@available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
 public final class Pipeline: @unchecked Sendable {
     public let config: ImageKitConfiguration
     private let session: URLSession
@@ -174,10 +176,13 @@ public final class Pipeline: @unchecked Sendable {
         // Memory fast path (TTL-aware)
         if let cached = await memory.image(for: mKey) { return cached }
         
-        return try await inflight.run(key: mKey.cacheKey) { [self] in
+        // Inflight coalescing with WEAK self to avoid Pipeline <-> Task retention
+        return try await inflight.run(key: mKey.cacheKey) { [weak self] in
+            guard let self else { throw ImageKitError.cancelled }
+            
             // Disk path
-            if let candidate = try await disk.read(url: url) {
-                let effDiskTTL = ttl ?? candidate.meta.cacheTTL ?? self.config.defaultTTL
+            if let candidate = try await self.disk.read(url: url) {
+                let effDiskTTL  = ttl ?? candidate.meta.cacheTTL ?? self.config.defaultTTL
                 let wantsRefresh = !candidate.isFresh(now: Date(), ttl: effDiskTTL)
                 
                 if let ui = candidate.decodeDownsampled(to: targetSize, scale: resolvedScale) {
@@ -185,22 +190,26 @@ public final class Pipeline: @unchecked Sendable {
                     await self.memory.insert(ui, for: mKey, ttl: memTTL)
                     
                     if wantsRefresh {
-                        Task { try? await self.refetch(url: url) } // background refresh
+                        // Background refresh, keep weak self
+                        Task { [weak self] in
+                            guard let self else { return }
+                            _ = try? await self.refetch(url: url)
+                        }
                     }
                     return ui
                 }
             }
             
             // Network path
-            let (data, meta) = try await fetch(url: url)
-            try await disk.write(url: url, data: data, meta: meta)
+            let (data, meta) = try await self.fetch(url: url)
+            try await self.disk.write(url: url, data: data, meta: meta)
             
             guard let ui = DiskCache.Decoded.decode(data: data, targetSize: targetSize, scale: resolvedScale) else {
                 throw ImageKitError.decodingFailed
             }
-            let effDiskTTL = ttl ?? meta.cacheTTL ?? config.defaultTTL
-            let memTTL = config.memoryTTL ?? effDiskTTL
-            await memory.insert(ui, for: mKey, ttl: memTTL)
+            let effDiskTTL = ttl ?? meta.cacheTTL ?? self.config.defaultTTL
+            let memTTL     = self.config.memoryTTL ?? effDiskTTL
+            await self.memory.insert(ui, for: mKey, ttl: memTTL)
             return ui
         }
     }
@@ -228,7 +237,7 @@ public final class Pipeline: @unchecked Sendable {
         if let cached = try? await disk.read(url: url),
            let v = cached.meta.validators() {
             if let etag = v.etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-            if let lm = v.lastModified { request.setValue(lm, forHTTPHeaderField: "If-Modified-Since") }
+            if let lm   = v.lastModified { request.setValue(lm, forHTTPHeaderField: "If-Modified-Since") }
         }
         
         let (data, response) = try await session.ikData(for: request)
@@ -297,6 +306,7 @@ final class MemoryCache: @unchecked Sendable {
 
 // MARK: - Disk Cache (Application Support) with per-entry TTL
 
+@available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
 actor DiskCache {
     struct Meta: Codable, Sendable {
         var etag: String?
@@ -466,7 +476,7 @@ actor DiskCache {
             entries.append((u, date, size))
         }
         if total <= sizeLimit { return }
-        entries.sort { $0.date < $1.date }
+        entries.sort { $0.date < $1.date } // LRU-ish via mod date
         for e in entries {
             try? fm.removeItem(at: e.url)
             let mURL = e.url.deletingPathExtension().appendingPathExtension("json")
@@ -483,8 +493,10 @@ private extension JSONDecoder {
 
 // MARK: - In-Flight Coalescing
 
+@available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
 actor Inflight {
     private var tasks: [String: Task<UIImage, Error>] = [:]
+    
     func run(key: String, _ block: @escaping () async throws -> UIImage) async throws -> UIImage {
         if let existing = tasks[key] { return try await existing.value }
         let t = Task { try await block() }
@@ -499,6 +511,7 @@ actor Inflight {
 #if canImport(SwiftUI)
 import SwiftUI
 
+@available(iOS 13, macOS 11, tvOS 13, watchOS 7, *)
 public struct AsyncImageView<Placeholder: View>: View {
     public let url: URL?
     public let placeholder: () -> Placeholder
@@ -543,6 +556,7 @@ public struct AsyncImageView<Placeholder: View>: View {
                         didFail = false
                     }
                 } catch ImageKitError.cancelled {
+                    // benign
                 } catch {
                     withAnimation(.easeIn(duration: 0.15)) { didFail = true }
                 }
@@ -552,13 +566,18 @@ public struct AsyncImageView<Placeholder: View>: View {
     
     @ViewBuilder
     private func unavailableView() -> some View {
-        VStack(spacing: 8) {
+        let stack = VStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill").imageScale(.large)
             Text("Image unavailable").font(.footnote.weight(.semibold))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .foregroundStyle(.secondary)
-        .accessibilityLabel("Image unavailable")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityLabel("Image unavailable")
+        
+        if #available(iOS 15, macOS 12, *) {
+            stack.foregroundStyle(.secondary)
+        } else {
+            stack.foregroundColor(.secondary)
+        }
     }
 }
 #endif
@@ -568,6 +587,7 @@ public struct AsyncImageView<Placeholder: View>: View {
 #if canImport(UIKit)
 import UIKit
 
+@available(iOS 13, *)
 public final class AsyncUIImageView: UIView {
     public var url: URL? { didSet { load() } }
     public var placeholder: UIImage? { didSet { imageView.image = placeholder } }
@@ -578,41 +598,98 @@ public final class AsyncUIImageView: UIView {
         didSet { imageView.contentMode = contentMode }
     }
     
-    private let imageView = UIImageView()
-    private let indicator = UIActivityIndicatorView(style: .medium)
+    // MARK: - Subviews
+    private let imageView  = UIImageView()
+    private let indicator  = UIActivityIndicatorView(style: .medium)
+    private let unavailableOverlay = UIView()
+    private let unavailableIcon = UIImageView(image: UIImage(systemName: "exclamationmark.triangle.fill"))
+    private let unavailableLabel: UILabel = {
+        let l = UILabel()
+        let base = UIFont.preferredFont(forTextStyle: .footnote)
+        l.font = UIFont.systemFont(ofSize: base.pointSize, weight: .semibold)
+        l.text = "Image unavailable"
+        l.textColor = .secondaryLabel
+        l.textAlignment = .center
+        l.numberOfLines = 1
+        return l
+    }()
     private var loadTask: Task<Void, Never>?
     private var lastTargetSize: CGSize = .zero
     
+    // MARK: - Init
     public override init(frame: CGRect) { super.init(frame: frame); commonInit() }
     public required init?(coder: NSCoder) { super.init(coder: coder); commonInit() }
     deinit { cancel() }
     
     private func commonInit() {
         clipsToBounds = true
+        
+        // Image
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.clipsToBounds = true
         imageView.contentMode = .scaleAspectFill
+        
+        // Spinner
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.hidesWhenStopped = true
-        addSubview(imageView); addSubview(indicator)
+        
+        // Unavailable overlay (covers entire view)
+        unavailableOverlay.translatesAutoresizingMaskIntoConstraints = false
+        unavailableOverlay.isUserInteractionEnabled = false
+        unavailableOverlay.isAccessibilityElement = true
+        unavailableOverlay.accessibilityLabel = "Image unavailable"
+        unavailableOverlay.isHidden = true
+        
+        // Icon styling
+        unavailableIcon.translatesAutoresizingMaskIntoConstraints = false
+        unavailableIcon.tintColor = .secondaryLabel
+        unavailableIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(scale: .large)
+        unavailableIcon.setContentHuggingPriority(.required, for: .vertical)
+        
+        // Stack inside overlay
+        let stack = UIStackView(arrangedSubviews: [unavailableIcon, unavailableLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 8
+        
+        addSubview(imageView)
+        addSubview(indicator)
+        addSubview(unavailableOverlay)
+        unavailableOverlay.addSubview(stack)
+        
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
             imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
             imageView.topAnchor.constraint(equalTo: topAnchor),
             imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            
             indicator.centerXAnchor.constraint(equalTo: centerXAnchor),
             indicator.centerYAnchor.constraint(equalTo: centerYAnchor),
+            
+            unavailableOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            unavailableOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            unavailableOverlay.topAnchor.constraint(equalTo: topAnchor),
+            unavailableOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+            
+            stack.centerXAnchor.constraint(equalTo: unavailableOverlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: unavailableOverlay.centerYAnchor)
         ])
     }
     
+    // MARK: - API
     public func set(url: URL?, placeholder: UIImage? = nil, ttl: TimeInterval? = nil) {
         self.placeholder = placeholder
         self.ttl = ttl
         self.url = url
     }
     
-    public func cancel() { loadTask?.cancel(); loadTask = nil }
+    public func cancel() {
+        loadTask?.cancel()
+        loadTask = nil
+    }
     
+    // MARK: - Layout
     private func resolvedTargetSize() -> CGSize {
         layoutIfNeeded()
         var size = bounds.size
@@ -624,14 +701,24 @@ public final class AsyncUIImageView: UIView {
         super.layoutSubviews()
         let newSize = bounds.size
         if url != nil, newSize != .zero,
-           abs(newSize.width - lastTargetSize.width) > 1 || abs(newSize.height - lastTargetSize.height) > 1 {
+           abs(newSize.width - lastTargetSize.width) > 1 ||
+            abs(newSize.height - lastTargetSize.height) > 1 {
             load()
         }
     }
     
+    // MARK: - Unavailable overlay
+    private func showUnavailable(_ show: Bool) {
+        if unavailableOverlay.isHidden == !show { return }
+        unavailableOverlay.isHidden = !show
+    }
+    
+    // MARK: - Loading
     private func load() {
         cancel()
         imageView.image = placeholder
+        showUnavailable(false)
+        
         guard let url = url else { return }
         indicator.startAnimating()
         let target = resolvedTargetSize()
@@ -641,23 +728,33 @@ public final class AsyncUIImageView: UIView {
             guard let self else { return }
             do {
                 let img = try await ImageKit.shared.uiImage(
-                    for: url, targetSize: target, scale: nil, ttl: ttl
+                    for: url, targetSize: target, scale: nil, ttl: self.ttl
                 )
                 if Task.isCancelled { return }
-                await MainActor.run {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
                     self.indicator.stopAnimating()
+                    self.showUnavailable(false)
                     if self.animated {
-                        UIView.transition(with: self.imageView, duration: 0.25, options: .transitionCrossDissolve) {
-                            self.imageView.image = img
+                        let iv = self.imageView
+                        UIView.transition(with: iv, duration: 0.25, options: .transitionCrossDissolve) {
+                            iv.image = img
                         }
                     } else {
                         self.imageView.image = img
                     }
                 }
             } catch ImageKitError.cancelled {
-                await MainActor.run { self.indicator.stopAnimating() }
+                await MainActor.run { [weak self] in
+                    self?.indicator.stopAnimating()
+                    // cancelled: keep current content, do not show unavailable
+                }
             } catch {
-                await MainActor.run { self.indicator.stopAnimating() }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.indicator.stopAnimating()
+                    self.showUnavailable(true)
+                }
             }
         }
     }
@@ -666,6 +763,7 @@ public final class AsyncUIImageView: UIView {
 
 // MARK: - Lifecycle
 
+@available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
 public enum ImageKitLifecycle {
     public static func applicationDidReceiveMemoryWarning() {
         Task { await ImageKit.shared.clearMemory() }
