@@ -1,0 +1,92 @@
+name: iOS Package CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    env:
+      SCHEME: ImageKit
+      DESTINATION: 'platform=iOS Simulator,name=iPhone 15'
+      CONFIG: Debug
+      # If you also want to do a Release build, the job below includes it.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      - name: Show versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # Optional but helpful: cache SPM artifacts used by xcodebuild
+      - name: Cache DerivedData (SPM)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Developer/Xcode/DerivedData
+            ~/Library/Caches/org.swift.swiftpm
+            ~/.swiftpm
+          key: ${{ runner.os }}-xcode-16.4-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-16.4-spm-
+
+      - name: Resolve package graph
+        run: |
+          xcodebuild -resolvePackageDependencies
+
+      - name: Build (Debug, iOS Simulator)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -scheme "${SCHEME}" \
+            -destination "${DESTINATION}" \
+            -configuration "${CONFIG}" \
+            -sdk iphonesimulator \
+            -skipPackagePluginValidation \
+            build | xcpretty
+
+      - name: Build (Release, iOS Simulator)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -scheme "${SCHEME}" \
+            -destination "${DESTINATION}" \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -skipPackagePluginValidation \
+            build | xcpretty
+
+      # If you add unit tests later, uncomment this:
+      # - name: Test (Debug, iOS Simulator)
+      #   run: |
+      #     set -o pipefail
+      #     xcodebuild \
+      #       -scheme "${SCHEME}" \
+      #       -destination "${DESTINATION}" \
+      #       -configuration Debug \
+      #       -sdk iphonesimulator \
+      #       -resultBundlePath TestResults.xcresult \
+      #       test | xcpretty
+      #
+      # - name: Upload Test Results
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: TestResults.xcresult
+      #     path: TestResults.xcresult
